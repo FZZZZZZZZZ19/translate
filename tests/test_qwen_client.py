@@ -148,7 +148,7 @@ class TestParseResponse:
 
     def test_parse_no_array_raises(self) -> None:
         """无 JSON 数组抛出 parse 错误。"""
-        with pytest.raises(QwenError, match="未找到 JSON 数组"):
+        with pytest.raises(QwenError, match="未找到行数组"):
             _parse_response('{"result": "no array here"}')
 
     def test_parse_invalid_json_raises(self) -> None:
@@ -158,7 +158,7 @@ class TestParseResponse:
 
     def test_parse_empty_array_raises(self) -> None:
         """空数组抛出 parse 错误（没有有效行）。"""
-        with pytest.raises(QwenError, match="无有效行"):
+        with pytest.raises(QwenError, match="全部未通过字段校验"):
             _parse_response("[]")
 
 
