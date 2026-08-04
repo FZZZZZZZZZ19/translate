@@ -1,6 +1,6 @@
 """ScreenCaptureOCR Translator —— 程序入口。
 
-创建 QApplication、系统托盘、全局热键注册、状态机调度。
+启动显示主控制面板窗口；关闭窗口最小化到系统托盘。
 """
 
 from __future__ import annotations
@@ -11,20 +11,23 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QRect, QTimer
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
     QMenu,
+    QMessageBox,
     QSystemTrayIcon,
 )
 
-from app.config import ConfigManager
+from app.config import AppConfig, ConfigManager
 from app.hotkey import GlobalHotkey
+from app.main_window import MainWindow
 from app.pipeline import AppController
+from app.qwen_client import VisionLine
 from app.result_overlay import ResultOverlay
 from app.screen import ScreenMapper, grab_fullscreen
 from app.selection_overlay import SelectionOverlay
@@ -33,11 +36,7 @@ from app.selection_overlay import SelectionOverlay
 
 
 def _setup_logging() -> str:
-    """配置日志：输出到 %APPDATA%/ScreenCaptureOCR/app.log，级别 INFO。
-
-    Returns:
-        日志文件路径。
-    """
+    """配置日志：输出到 %APPDATA%/ScreenCaptureOCR/app.log。"""
     appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
     log_dir = Path(appdata) / "ScreenCaptureOCR"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -55,17 +54,9 @@ def _setup_logging() -> str:
 
 
 def _create_tray_icon() -> QIcon:
-    """创建托盘图标：优先加载 icon.ico，否则程序绘制。
-
-    Returns:
-        QIcon 对象。
-    """
-    # 尝试加载 icon.ico
+    """创建托盘图标：优先 icon.ico，否则程序绘制。"""
     if getattr(sys, "frozen", False):
-        icon_dirs = [
-            Path(sys.executable).parent / "assets",
-            Path(sys.executable).parent,
-        ]
+        icon_dirs = [Path(sys.executable).parent / "assets", Path(sys.executable).parent]
     else:
         icon_dirs = [Path(__file__).parent / "assets"]
 
@@ -74,10 +65,8 @@ def _create_tray_icon() -> QIcon:
         if p.exists():
             return QIcon(str(p))
 
-    # 兜底：程序绘制简单图标（32x32 蓝色圆角矩形 + "译"字）
     pixmap = QPixmap(32, 32)
     pixmap.fill(Qt.transparent)
-
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setBrush(QColor(66, 133, 244))
@@ -90,7 +79,6 @@ def _create_tray_icon() -> QIcon:
     painter.setFont(font)
     painter.drawText(pixmap.rect(), Qt.AlignCenter, "译")
     painter.end()
-
     return QIcon(pixmap)
 
 
@@ -98,18 +86,13 @@ def _create_tray_icon() -> QIcon:
 
 
 def main() -> int:
-    """程序主入口。
-
-    Returns:
-        退出码（0 = 正常）。
-    """
     log_path = _setup_logging()
     logger = logging.getLogger("main")
     logger.info("=" * 60)
     logger.info("ScreenCaptureOCR Translator 启动 (v1.1)")
     logger.info("日志文件: %s", log_path)
 
-    # ── HighDPI 属性（必须在创建 QApplication 之前设置）──
+    # ── HighDPI ──
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -120,215 +103,250 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("ScreenCaptureOCR Translator")
 
-    # ── 核心组件 ──────────────────────────────────────────
+    # ── 核心组件 ──
     cfg = ConfigManager()
     config = cfg.load()
     mapper = ScreenMapper()
     controller = AppController(cfg, mapper)
 
-    # 覆盖层（单例复用）
+    # 覆盖层
     result_overlay = ResultOverlay(mapper)
-    # 应用当前样式
-    result_overlay.configure_style(
+
+    # 选区遮罩引用
+    selection_overlay: Optional[SelectionOverlay] = None
+
+    # ── 主窗口 ──
+    main_win = MainWindow(
+        api_key=config.api_key,
+        model=config.model,
+        hotkey=config.hotkey,
         bg_color=config.overlay.bg_color,
         text_color=config.overlay.text_color,
         padding=config.overlay.padding,
         min_font_size=config.overlay.min_font_size,
+        max_image_side=config.max_image_side,
     )
 
-    # 选区遮罩实例引用
-    selection_overlay: Optional[SelectionOverlay] = None
+    # ── 托盘 ──
+    tray = QSystemTrayIcon()
+    tray.setIcon(_create_tray_icon())
+    tray.setToolTip("截图翻译 · ScreenCaptureOCR Translator")
 
-    # ── 设置窗口工厂 ──────────────────────────────────────
+    # 双击托盘 → 显示主窗口
+    tray.activated.connect(
+        lambda reason: (
+            main_win.show() if reason == QSystemTrayIcon.DoubleClick else None
+        )
+    )
 
-    settings_dialog: Optional[object] = None
+    # 托盘菜单
+    tray_menu = QMenu()
+    action_show = QAction("显示主窗口", tray_menu)
+    action_show.triggered.connect(main_win.show)
+    tray_menu.addAction(action_show)
 
-    def open_settings() -> None:
-        """打开设置对话框。"""
-        nonlocal settings_dialog
-        from app.settings_dialog import SettingsDialog
+    action_capture = QAction("截图翻译", tray_menu)
+    tray_menu.addAction(action_capture)
 
-        dlg = SettingsDialog(cfg, hotkey)
-        if dlg.exec_() == dlg.Accepted:
-            # 重新加载配置并应用样式
-            new_cfg = cfg.load()
-            result_overlay.configure_style(
-                bg_color=new_cfg.overlay.bg_color,
-                text_color=new_cfg.overlay.text_color,
-                padding=new_cfg.overlay.padding,
-                min_font_size=new_cfg.overlay.min_font_size,
-            )
-            tray.showMessage(
-                "截图翻译", "设置已保存",
-                QSystemTrayIcon.Information, 2000,
-            )
+    tray_menu.addSeparator()
 
-    # ── 内部辅助函数 ──────────────────────────────────────
+    action_quit = QAction("退出", tray_menu)
+    tray_menu.addAction(action_quit)
 
-    def _save_selection_png(
-        screenshot: QPixmap, mapper_obj: ScreenMapper, rect
-    ) -> None:
-        """保存选区图到临时目录 PNG（调试用）。"""
-        try:
-            cropped = mapper_obj.crop_qimage(screenshot, rect)
-            tmp_dir = Path(tempfile.gettempdir()) / "ScreenCaptureOCR"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = tmp_dir / f"selection_{timestamp}.png"
-            cropped.save(str(out_path), "PNG")
-            logger.info(
-                "选区图已保存: %s (%dx%d)",
-                out_path, cropped.width(), cropped.height(),
-            )
-        except Exception as e:
-            logger.error("保存选区图失败: %s", e)
+    tray.setContextMenu(tray_menu)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        logger.warning("系统托盘不可用")
+
+    # ── 内部辅助函数 ──
+
+    def _apply_style() -> None:
+        """应用当前 UI 中的覆盖层样式。"""
+        d = main_win.get_config_dict()
+        result_overlay.configure_style(
+            bg_color=d["bg_color"],
+            text_color=d["text_color"],
+            padding=d["padding"],
+            min_font_size=d["min_font_size"],
+        )
 
     def _hide_selection() -> None:
-        """隐藏选区遮罩（若有）。"""
         nonlocal selection_overlay
         if selection_overlay:
             selection_overlay.hide()
             selection_overlay = None
 
-    def _hide_result_overlay() -> None:
-        """隐藏覆盖层。"""
+    def _hide_result() -> None:
         result_overlay.clear()
 
     def create_selection_overlay() -> SelectionOverlay:
-        """创建新的选区遮罩实例（每次流程新建，因为底图会变）。"""
         nonlocal selection_overlay
         screenshot = grab_fullscreen()
         overlay = SelectionOverlay(mapper, screenshot)
         overlay.selection_done.connect(controller.on_selection_done)
         overlay.cancelled.connect(controller.on_selection_cancelled)
-        # 保存选区 PNG 供调试
         overlay.selection_done.connect(
-            lambda rect: _save_selection_png(screenshot, mapper, rect)
+            lambda rect: _save_debug_png(screenshot, mapper, rect)
         )
         selection_overlay = overlay
         return overlay
 
-    # ── 热键回调 ──────────────────────────────────────────
+    def _save_debug_png(screenshot, mapper_obj, rect) -> None:
+        try:
+            cropped = mapper_obj.crop_qimage(screenshot, rect)
+            tmp_dir = Path(tempfile.gettempdir()) / "ScreenCaptureOCR"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out = tmp_dir / f"selection_{ts}.png"
+            cropped.save(str(out), "PNG")
+        except Exception:
+            pass
+
+    # ── 热键回调 ──
 
     def on_hotkey_trigger() -> None:
-        """全局热键触发：启动截图翻译流程。"""
+        """热键触发：检查开关 → 启动流程。"""
+        if not main_win.is_enabled:
+            main_win.set_status("翻译已关闭，请先开启")
+            return
         logger.info("热键触发")
         controller.start_screen_flow()
 
     def on_esc() -> None:
-        """ESC 全局回调：退出覆盖层。"""
-        logger.info("ESC 全局回调")
         controller.on_esc_in_overlay()
 
     hotkey = GlobalHotkey(on_hotkey_trigger, on_esc)
 
-    # ── 流程信号连接 ──────────────────────────────────────
+    def _reload_hotkey() -> None:
+        """重新加载配置并注册热键。"""
+        new_cfg = cfg.load()
+        _apply_style()
+        hotkey.register(new_cfg.hotkey)
 
-    # 流程开始：隐藏旧覆盖层 → 创建选区遮罩
-    controller.flow_started.connect(_hide_result_overlay)
-    controller.flow_started.connect(lambda: create_selection_overlay().start())
+    # ── 信号连接 ──
 
-    # 流程结束：隐藏选区遮罩 + 覆盖层
-    controller.flow_finished.connect(_hide_selection)
-    controller.flow_finished.connect(_hide_result_overlay)
-
-    # 翻译完成：显示覆盖层
-    controller.translations_ready.connect(result_overlay.show_translations)
-
-    # ── 系统托盘 ──────────────────────────────────────────
-
-    tray_icon = _create_tray_icon()
-
-    tray = QSystemTrayIcon()
-    tray.setIcon(tray_icon)
-    tray.setToolTip("屏幕截图 AI 翻译")
-
-    # 双击托盘 = 触发截图翻译
-    tray.activated.connect(
-        lambda reason: (
-            on_hotkey_trigger()
-            if reason == QSystemTrayIcon.DoubleClick
-            else None
+    # 主窗口设置保存 → 写配置 + 重新注册热键
+    def _on_settings_changed() -> None:
+        d = main_win.get_config_dict()
+        new_cfg = AppConfig(
+            api_key=d["api_key"],
+            model=d["model"],
+            hotkey=d["hotkey"],
+            max_image_side=d["max_image_side"],
         )
-    )
+        new_cfg.overlay.bg_color = d["bg_color"]
+        new_cfg.overlay.text_color = d["text_color"]
+        new_cfg.overlay.padding = d["padding"]
+        new_cfg.overlay.min_font_size = d["min_font_size"]
 
-    # 托盘菜单
-    menu = QMenu()
+        try:
+            cfg.save(new_cfg)
+        except OSError as e:
+            logger.error("配置保存失败: %s", e)
+            QMessageBox.warning(main_win, "错误", f"保存失败: {e}")
+            return
 
-    action_capture = QAction("截图翻译", menu)
+        _apply_style()
+
+        # 重新注册热键
+        if d["hotkey"] != config.hotkey:
+            ok, err = hotkey.register(d["hotkey"])
+            if not ok:
+                hotkey.register(config.hotkey)  # 回滚
+                QMessageBox.warning(main_win, "热键注册失败", err)
+            else:
+                config.hotkey = d["hotkey"]
+                main_win.set_status(f"热键已更新为 {d['hotkey']}")
+
+        main_win.set_status("设置已保存")
+        tray.showMessage("截图翻译", "设置已保存", QSystemTrayIcon.Information, 1500)
+
+    main_win.settings_changed.connect(_on_settings_changed)
+
+    # 翻译开关
+    def _on_toggle(enabled: bool) -> None:
+        if enabled:
+            hotkey.register(config.hotkey)
+            main_win.set_status("翻译已开启 · 按快捷键或托盘菜单开始")
+        else:
+            main_win.set_status("翻译已关闭")
+
+    main_win.toggle_changed.connect(_on_toggle)
+
+    # 托盘菜单"截图翻译"
     action_capture.triggered.connect(on_hotkey_trigger)
-    menu.addAction(action_capture)
 
-    menu.addSeparator()
-
-    action_settings = QAction("设置", menu)
-    action_settings.triggered.connect(open_settings)
-    menu.addAction(action_settings)
-
-    menu.addSeparator()
-
-    action_quit = QAction("退出", menu)
-    action_quit.triggered.connect(app.quit)
-    menu.addAction(action_quit)
-
-    tray.setContextMenu(menu)
-
-    # 连接状态消息到托盘气泡
+    # 流程信号
+    controller.flow_started.connect(_hide_result)
+    controller.flow_started.connect(lambda: create_selection_overlay().start())
+    controller.flow_finished.connect(_hide_selection)
+    controller.flow_finished.connect(_hide_result)
+    controller.status_message.connect(main_win.set_status)
     controller.status_message.connect(
-        lambda msg: tray.showMessage(
-            "截图翻译", msg,
-            QSystemTrayIcon.Information, 2000,
-        )
+        lambda msg: tray.showMessage("截图翻译", msg, QSystemTrayIcon.Information, 2000)
     )
 
-    # 检查托盘可用性
-    if not QSystemTrayIcon.isSystemTrayAvailable():
-        logger.warning("系统托盘不可用，请检查桌面环境")
-    tray.show()
+    # 翻译完成 → 显示覆盖层 + 记录日志
+    def _on_translations(items: List[VisionLine]) -> None:
+        result_overlay.show_translations(items)
+        # 记录日志
+        for item in items:
+            main_win.add_log(item.text, item.translation)
+        main_win.set_status(f"翻译完成 ({len(items)} 行)，按 ESC 退出")
 
-    # 首次运行：无 API Key 时自动打开设置对话框
-    if not config.api_key:
-        logger.info("首次运行，未检测到 API Key，自动打开设置")
-        QTimer.singleShot(500, open_settings)
-        tray.showMessage(
-            "截图翻译",
-            "欢迎！请先在设置中填入千问 API Key\n右键托盘图标 → 设置",
-            QSystemTrayIcon.Information,
-            8000,
-        )
+    controller.translations_ready.connect(_on_translations)
 
-    # ── 注册热键 ──────────────────────────────────────────
+    # 流程失败 → 日志
+    def _on_failed_log(msg: str) -> None:
+        main_win.add_status_log(f"错误: {msg}")
 
+    controller.status_message.connect(
+        lambda msg: main_win.add_status_log(msg) if "失败" in msg or "错误" in msg else None
+    )
+
+    # ── 退出 ──
+    def _quit() -> None:
+        logger.info("用户请求退出")
+        hotkey.unregister()
+        controller.shutdown()
+        _hide_selection()
+        _hide_result()
+        main_win.hide()
+        app.quit()
+
+    action_quit.triggered.connect(_quit)
+
+    # ── 启动 ──
+
+    # 注册热键
     ok, err = hotkey.register(config.hotkey)
     if not ok:
         logger.error("热键注册失败: %s", err)
-        tray.showMessage(
+        main_win.add_status_log(f"热键 {config.hotkey} 注册失败: {err}")
+
+    # 显示主窗口 + 托盘
+    main_win.show()
+    tray.show()
+
+    # 首次运行：无 API Key → 提示
+    if not config.api_key:
+        main_win.set_status("请先填入 API Key 并保存设置")
+        QTimer.singleShot(800, lambda: tray.showMessage(
             "截图翻译",
-            f"热键 {config.hotkey} 注册失败: {err}\n请在设置中更换快捷键",
-            QSystemTrayIcon.Warning,
-            5000,
-        )
+            "请先在主窗口中填入千问 API Key\n点击「保存设置」后即可使用",
+            QSystemTrayIcon.Information,
+            6000,
+        ))
 
-    logger.info("应用就绪，等待热键 %s", config.hotkey)
-    tray.showMessage(
-        "截图翻译",
-        f"已启动\n快捷键: {config.hotkey}",
-        QSystemTrayIcon.Information,
-        2000,
-    )
+    logger.info("应用就绪")
+    main_win.set_status(f"就绪 · 快捷键: {config.hotkey}")
 
-    # ── 事件循环 ──────────────────────────────────────────
-
+    # ── 事件循环 ──
     try:
         exit_code = app.exec_()
     finally:
-        logger.info("应用退出中…")
         hotkey.unregister()
         controller.shutdown()
-        if selection_overlay:
-            selection_overlay.hide()
-        result_overlay.clear()
-        logger.info("应用已退出")
     return exit_code
 
 
