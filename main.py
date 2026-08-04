@@ -56,7 +56,13 @@ def _setup_logging() -> str:
 def _create_tray_icon() -> QIcon:
     """创建托盘图标：优先 icon.ico，否则程序绘制。"""
     if getattr(sys, "frozen", False):
-        icon_dirs = [Path(sys.executable).parent / "assets", Path(sys.executable).parent]
+        # onefile 模式：资源解压到 sys._MEIPASS
+        meipass = Path(getattr(sys, "_MEIPASS", sys.executable)).parent
+        icon_dirs = [
+            meipass / "assets",
+            Path(sys.executable).parent / "assets",
+            Path(sys.executable).parent,
+        ]
     else:
         icon_dirs = [Path(__file__).parent / "assets"]
 
