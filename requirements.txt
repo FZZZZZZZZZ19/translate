@@ -1,0 +1,4 @@
+PyQt5>=5.15.10
+keyboard>=0.13.5
+requests>=2.31
+pytest>=8.0
