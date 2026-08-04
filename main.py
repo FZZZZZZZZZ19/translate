@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
 from app.config import ConfigManager
 from app.hotkey import GlobalHotkey
 from app.pipeline import AppController
+from app.result_overlay import ResultOverlay
 from app.screen import ScreenMapper, grab_fullscreen
 from app.selection_overlay import SelectionOverlay
 
@@ -125,15 +126,49 @@ def main() -> int:
     mapper = ScreenMapper()
     controller = AppController(cfg, mapper)
 
-    # 选区遮罩实例引用（当前活动的）
+    # 覆盖层（单例复用）
+    result_overlay = ResultOverlay(mapper)
+    # 应用当前样式
+    result_overlay.configure_style(
+        bg_color=config.overlay.bg_color,
+        text_color=config.overlay.text_color,
+        padding=config.overlay.padding,
+        min_font_size=config.overlay.min_font_size,
+    )
+
+    # 选区遮罩实例引用
     selection_overlay: Optional[SelectionOverlay] = None
+
+    # ── 设置窗口工厂 ──────────────────────────────────────
+
+    settings_dialog: Optional[object] = None
+
+    def open_settings() -> None:
+        """打开设置对话框。"""
+        nonlocal settings_dialog
+        from app.settings_dialog import SettingsDialog
+
+        dlg = SettingsDialog(cfg, hotkey)
+        if dlg.exec_() == dlg.Accepted:
+            # 重新加载配置并应用样式
+            new_cfg = cfg.load()
+            result_overlay.configure_style(
+                bg_color=new_cfg.overlay.bg_color,
+                text_color=new_cfg.overlay.text_color,
+                padding=new_cfg.overlay.padding,
+                min_font_size=new_cfg.overlay.min_font_size,
+            )
+            tray.showMessage(
+                "截图翻译", "设置已保存",
+                QSystemTrayIcon.Information, 2000,
+            )
 
     # ── 内部辅助函数 ──────────────────────────────────────
 
     def _save_selection_png(
         screenshot: QPixmap, mapper_obj: ScreenMapper, rect
     ) -> None:
-        """批次 A 验收：将选区图保存到临时目录 PNG。"""
+        """保存选区图到临时目录 PNG（调试用）。"""
         try:
             cropped = mapper_obj.crop_qimage(screenshot, rect)
             tmp_dir = Path(tempfile.gettempdir()) / "ScreenCaptureOCR"
@@ -155,6 +190,10 @@ def main() -> int:
             selection_overlay.hide()
             selection_overlay = None
 
+    def _hide_result_overlay() -> None:
+        """隐藏覆盖层。"""
+        result_overlay.clear()
+
     def create_selection_overlay() -> SelectionOverlay:
         """创建新的选区遮罩实例（每次流程新建，因为底图会变）。"""
         nonlocal selection_overlay
@@ -162,7 +201,7 @@ def main() -> int:
         overlay = SelectionOverlay(mapper, screenshot)
         overlay.selection_done.connect(controller.on_selection_done)
         overlay.cancelled.connect(controller.on_selection_cancelled)
-        # 批次 A 验收：选区完成后保存 PNG
+        # 保存选区 PNG 供调试
         overlay.selection_done.connect(
             lambda rect: _save_selection_png(screenshot, mapper, rect)
         )
@@ -177,15 +216,24 @@ def main() -> int:
         controller.start_screen_flow()
 
     def on_esc() -> None:
-        """ESC 全局回调。"""
+        """ESC 全局回调：退出覆盖层。"""
         logger.info("ESC 全局回调")
         controller.on_esc_in_overlay()
 
     hotkey = GlobalHotkey(on_hotkey_trigger, on_esc)
 
-    # 连接流程信号
+    # ── 流程信号连接 ──────────────────────────────────────
+
+    # 流程开始：隐藏旧覆盖层 → 创建选区遮罩
+    controller.flow_started.connect(_hide_result_overlay)
     controller.flow_started.connect(lambda: create_selection_overlay().start())
-    controller.flow_finished.connect(lambda: _hide_selection())
+
+    # 流程结束：隐藏选区遮罩 + 覆盖层
+    controller.flow_finished.connect(_hide_selection)
+    controller.flow_finished.connect(_hide_result_overlay)
+
+    # 翻译完成：显示覆盖层
+    controller.translations_ready.connect(result_overlay.show_translations)
 
     # ── 系统托盘 ──────────────────────────────────────────
 
@@ -214,9 +262,7 @@ def main() -> int:
     menu.addSeparator()
 
     action_settings = QAction("设置", menu)
-    action_settings.triggered.connect(
-        lambda: logger.info("设置窗口（批次 C 实现）")
-    )
+    action_settings.triggered.connect(open_settings)
     menu.addAction(action_settings)
 
     menu.addSeparator()
@@ -227,11 +273,6 @@ def main() -> int:
 
     tray.setContextMenu(menu)
 
-    # 检查托盘可用性
-    if not QSystemTrayIcon.isSystemTrayAvailable():
-        logger.warning("系统托盘不可用，请检查桌面环境")
-    tray.show()
-
     # 连接状态消息到托盘气泡
     controller.status_message.connect(
         lambda msg: tray.showMessage(
@@ -239,6 +280,11 @@ def main() -> int:
             QSystemTrayIcon.Information, 2000,
         )
     )
+
+    # 检查托盘可用性
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        logger.warning("系统托盘不可用，请检查桌面环境")
+    tray.show()
 
     # ── 注册热键 ──────────────────────────────────────────
 
@@ -267,8 +313,10 @@ def main() -> int:
     finally:
         logger.info("应用退出中…")
         hotkey.unregister()
+        controller.shutdown()
         if selection_overlay:
             selection_overlay.hide()
+        result_overlay.clear()
         logger.info("应用已退出")
     return exit_code
 
