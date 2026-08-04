@@ -2,8 +2,6 @@
 venv/
 
 # PyInstaller
-dist/
-build/
 *.spec.bak
 
 # 配置文件（含 API Key）
