@@ -286,6 +286,17 @@ def main() -> int:
         logger.warning("系统托盘不可用，请检查桌面环境")
     tray.show()
 
+    # 首次运行：无 API Key 时自动打开设置对话框
+    if not config.api_key:
+        logger.info("首次运行，未检测到 API Key，自动打开设置")
+        QTimer.singleShot(500, open_settings)
+        tray.showMessage(
+            "截图翻译",
+            "欢迎！请先在设置中填入千问 API Key\n右键托盘图标 → 设置",
+            QSystemTrayIcon.Information,
+            8000,
+        )
+
     # ── 注册热键 ──────────────────────────────────────────
 
     ok, err = hotkey.register(config.hotkey)
